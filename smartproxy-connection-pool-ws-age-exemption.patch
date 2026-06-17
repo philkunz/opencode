@@ -1,0 +1,227 @@
+diff --git a/rust/crates/rustproxy-http/src/connection_pool.rs b/rust/crates/rustproxy-http/src/connection_pool.rs
+index 6fc7e3e..1b6ce8e 100644
+--- a/rust/crates/rustproxy-http/src/connection_pool.rs
++++ b/rust/crates/rustproxy-http/src/connection_pool.rs
+@@ -29,6 +29,43 @@ const MAX_H2_AGE: Duration = Duration::from_secs(120);
+ /// Maximum age for pooled QUIC/HTTP/3 connections.
+ const MAX_H3_AGE: Duration = Duration::from_secs(120);
+ 
++/// Tracks the number of active long-lived multiplexed streams (WebSocket /
++/// Extended CONNECT tunnels) currently riding a pooled H2/H3 connection.
++///
++/// The age caps above exist to recycle pooled connections before a backend's
++/// idle GOAWAY would (avoiding reuse-race 502s). That is correct for stateless
++/// request multiplexing, but a long-lived WebSocket tunnel must NOT be severed
++/// mid-stream just because the underlying pooled connection crossed the age cap.
++/// While `count() > 0`, the connection is exempt from age-based proactive
++/// eviction; it is removed only once its active tunnels drain.
++#[derive(Clone, Default)]
++pub struct ActiveStreams(Arc<AtomicU64>);
++
++impl ActiveStreams {
++    /// Current number of active multiplexed tunnels on this connection.
++    pub fn count(&self) -> u64 {
++        self.0.load(Ordering::Relaxed)
++    }
++
++    /// Register a new active tunnel. The returned guard decrements the count
++    /// when dropped (i.e. when the WebSocket tunnel task ends), so the pool can
++    /// resume normal age-based eviction once the connection is idle again.
++    pub fn guard(&self) -> ActiveStreamGuard {
++        self.0.fetch_add(1, Ordering::Relaxed);
++        ActiveStreamGuard(Arc::clone(&self.0))
++    }
++}
++
++/// RAII guard kept alive for the lifetime of a WebSocket/Extended CONNECT
++/// tunnel; decrements the owning connection's active-stream count on drop.
++pub struct ActiveStreamGuard(Arc<AtomicU64>);
++
++impl Drop for ActiveStreamGuard {
++    fn drop(&mut self) {
++        self.0.fetch_sub(1, Ordering::Relaxed);
++    }
++}
++
+ /// Protocol for pool key discrimination.
+ #[derive(Clone, Debug, Hash, Eq, PartialEq)]
+ pub enum PoolProtocol {
+@@ -62,6 +99,8 @@ struct PooledH2 {
+     /// Unique generation ID. Connection drivers use this to only remove their OWN
+     /// entry, preventing phantom eviction when multiple connections share the same key.
+     generation: u64,
++    /// Active long-lived multiplexed streams (WebSocket tunnels) on this connection.
++    active: ActiveStreams,
+ }
+ 
+ /// A pooled QUIC/HTTP/3 connection (multiplexed like H2).
+@@ -73,6 +112,8 @@ pub struct PooledH3 {
+     pub connection: quinn::Connection,
+     pub created_at: Instant,
+     pub generation: u64,
++    /// Active long-lived multiplexed streams (WebSocket tunnels) on this connection.
++    pub active: ActiveStreams,
+ }
+ 
+ /// Backend connection pool.
+@@ -169,19 +210,34 @@ impl ConnectionPool {
+     pub fn checkout_h2(
+         &self,
+         key: &PoolKey,
+-    ) -> Option<(http2::SendRequest<BoxBody<Bytes, hyper::Error>>, Duration)> {
++    ) -> Option<(
++        http2::SendRequest<BoxBody<Bytes, hyper::Error>>,
++        Duration,
++        ActiveStreams,
++    )> {
+         let entry = self.h2_pool.get(key)?;
+         let pooled = entry.value();
+         let age = pooled.created_at.elapsed();
+ 
+-        if pooled.sender.is_closed() || age >= MAX_H2_AGE {
++        if pooled.sender.is_closed() {
+             drop(entry);
+             self.h2_pool.remove(key);
+             return None;
+         }
++        if age >= MAX_H2_AGE {
++            // Aged out: stop handing this connection to NEW requests so they get a
++            // fresh one (GOAWAY-race avoidance preserved). Only physically evict it
++            // once its active long-lived streams have drained, so a live tunnel is
++            // never severed mid-stream.
++            if pooled.active.count() == 0 {
++                drop(entry);
++                self.h2_pool.remove(key);
++            }
++            return None;
++        }
+ 
+         if pooled.sender.is_ready() {
+-            return Some((pooled.sender.clone(), age));
++            return Some((pooled.sender.clone(), age, pooled.active.clone()));
+         }
+         None
+     }
+@@ -212,10 +268,11 @@ impl ConnectionPool {
+         &self,
+         key: PoolKey,
+         sender: http2::SendRequest<BoxBody<Bytes, hyper::Error>>,
+-    ) -> u64 {
++    ) -> (u64, ActiveStreams) {
+         let gen = self.h2_generation.fetch_add(1, Ordering::Relaxed);
++        let active = ActiveStreams::default();
+         if sender.is_closed() {
+-            return gen;
++            return (gen, active);
+         }
+         self.h2_pool.insert(
+             key.clone(),
+@@ -223,10 +280,11 @@ impl ConnectionPool {
+                 sender,
+                 created_at: Instant::now(),
+                 generation: gen,
++                active: active.clone(),
+             },
+         );
+         self.enforce_h2_key_limit(&key);
+-        gen
++        (gen, active)
+     }
+ 
+     // ── HTTP/3 (QUIC) pool methods ──
+@@ -240,25 +298,35 @@ impl ConnectionPool {
+         h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+         quinn::Connection,
+         Duration,
++        ActiveStreams,
+     )> {
+         let entry = self.h3_pool.get(key)?;
+         let pooled = entry.value();
+         let age = pooled.created_at.elapsed();
+ 
+-        if age >= MAX_H3_AGE {
++        // Dead QUIC connection is always evicted.
++        if pooled.connection.close_reason().is_some() {
+             drop(entry);
+             self.h3_pool.remove(key);
+             return None;
+         }
+-
+-        // Check if QUIC connection is still alive
+-        if pooled.connection.close_reason().is_some() {
+-            drop(entry);
+-            self.h3_pool.remove(key);
++        if age >= MAX_H3_AGE {
++            // Aged out: stop handing this connection to NEW requests, but only
++            // physically evict it once its active WebSocket tunnels have drained,
++            // so a live tunnel is never severed mid-stream.
++            if pooled.active.count() == 0 {
++                drop(entry);
++                self.h3_pool.remove(key);
++            }
+             return None;
+         }
+ 
+-        Some((pooled.send_request.clone(), pooled.connection.clone(), age))
++        Some((
++            pooled.send_request.clone(),
++            pooled.connection.clone(),
++            age,
++            pooled.active.clone(),
++        ))
+     }
+ 
+     /// Register a QUIC connection and its h3 SendRequest handle in the pool.
+@@ -268,8 +336,9 @@ impl ConnectionPool {
+         key: PoolKey,
+         connection: quinn::Connection,
+         send_request: h3::client::SendRequest<h3_quinn::OpenStreams, Bytes>,
+-    ) -> u64 {
++    ) -> (u64, ActiveStreams) {
+         let gen = self.h2_generation.fetch_add(1, Ordering::Relaxed);
++        let active = ActiveStreams::default();
+         self.h3_pool.insert(
+             key.clone(),
+             PooledH3 {
+@@ -277,10 +346,11 @@ impl ConnectionPool {
+                 connection,
+                 created_at: Instant::now(),
+                 generation: gen,
++                active: active.clone(),
+             },
+         );
+         self.enforce_h3_key_limit(&key);
+-        gen
++        (gen, active)
+     }
+ 
+     /// Remove a QUIC connection only if generation matches.
+@@ -370,11 +440,13 @@ impl ConnectionPool {
+                 h1_pool.remove(&key);
+             }
+ 
+-            // Evict dead or aged-out H2 connections
++            // Evict dead or aged-out H2 connections. Aged-out connections that
++            // still carry active WebSocket tunnels are kept until those drain.
+             let mut dead_h2 = Vec::new();
+             for entry in h2_pool.iter() {
+-                if entry.value().sender.is_closed()
+-                    || entry.value().created_at.elapsed() >= MAX_H2_AGE
++                let pooled = entry.value();
++                if pooled.sender.is_closed()
++                    || (pooled.created_at.elapsed() >= MAX_H2_AGE && pooled.active.count() == 0)
+                 {
+                     dead_h2.push(entry.key().clone());
+                 }
+@@ -386,8 +458,9 @@ impl ConnectionPool {
+             // Evict dead or aged-out H3 (QUIC) connections
+             let mut dead_h3 = Vec::new();
+             for entry in h3_pool.iter() {
+-                if entry.value().connection.close_reason().is_some()
+-                    || entry.value().created_at.elapsed() >= MAX_H3_AGE
++                let pooled = entry.value();
++                if pooled.connection.close_reason().is_some()
++                    || (pooled.created_at.elapsed() >= MAX_H3_AGE && pooled.active.count() == 0)
+                 {
+                     dead_h3.push(entry.key().clone());
+                 }
